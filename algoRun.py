@@ -46,7 +46,7 @@ cnx = mysql.connector.connect(**config)
 cursor = cnx.cursor()
 print "Connection made to DB."
 
-with open('/Users/dvorva/Documents/Research/getGraphiteData/sequentialBLR/smartDriver.json') as data_file:
+with open('/Users/dvorva/Documents/Research/getGraphiteData/insertAnom/smartDriver.json') as data_file:
     jsonDataFile = json.load(data_file)
 print "Found JSON file."
 
@@ -116,6 +116,20 @@ if(int(jsonDataFile["specifyTime"])):
 
 granularityInSeconds = int(jsonDataFile["granularity"])*60
 
+# Anomaly scenarios - Injecting anomalies of size shift
+shift = 5000 # Can be changed to create larger/smaller anomalies
+ground_truth = []
+anomaly_prediction = []
+event_dict = {}
+DURATION = 45
+EVENT_NUMS = 2
+alrt_counter = 0
+for k in range(EVENT_NUMS):
+    t_rand = random.randint(matrixLength, 300000) #for all data
+    print "Setting anomaly at i: %d " % t_rand
+    for i in range(DURATION):
+        event_dict[t_rand + i] = 1
+
 #X window init.
 X =  np.zeros([matrixLength, len(columns)])
 Xt =  [None]*matrixLength
@@ -132,8 +146,11 @@ b_opt = 0
 rowCount = 1
 initTraining = 0
 notRunnableCount = 0
+Tp = 0; Fn = 0; Fp = 0
 mu = 0; sigma = 1000
 w, L = (.84, 3.719) # EWMA parameters. Other pairs can also be used, see paper
+sigma_w = np.sqrt(w/(2-w))
+THRESHOLD = L * sigma_w
 Sn_1 = 0
 p_array = []
 
@@ -145,7 +162,7 @@ while startTime < endTime:
         startTime = dt.datetime(2012, 6, 1)
 
     if(rowCount % 250 == 0):
-        print "trying time: %s " % startTime
+        print "trying time: %s with i: %d" % (startTime, rowCount)
 
     #Build the query:
     isFirst = 1
@@ -179,6 +196,10 @@ while startTime < endTime:
     Xt[(rowCount-1) % matrixLength] = startTime
     for i in range(0, len(columns)):
         #We have new valid data! Also update lastData
+        #INJECT ANOMALIES
+        if(i == 0 and rowCount in event_dict):
+            colSum[i] = colSum[i] + (shift*colCount[i])
+
         if colSum[i] > 0:
             if "motion" in columns[i]:
                 X[(rowCount-1) % matrixLength][i] = colSum[i]
@@ -220,23 +241,7 @@ while startTime < endTime:
         x_n = X[(rowCount-1) % matrixLength][:len(columns)-1]
         #y_time.append(Xt[(rowCount-1) % matrixLength])
         prediction = max(0, np.inner(w_opt,x_n))
-        # if prediction > 25000:
-        #     #retrain with old data
-        #     print "Error, prediction skyrocketed (potentially) due to beta = 0 NAN/INF"
-        #     print "Re-training on random set of old data, for this period"
-        #
-        #     #Create the new training matrix
-        #     tempData = []
-        #     tempActual = []
-        #     for i in range(0, int(0.75*len(X))):
-        #         randomRow = random.randint(0, len(X)-1)
-        #         tempData.append(X[randomRow][0:len(columns)-1])
-        #         tempActual.append(X[randomRow][len(columns)-1])
-        #
-        #     w_opt, a_opt, b_opt, S_N = train(tempData, tempActual)
-        #     prediction = max(0, np.inner(w_opt,x_n))
-        #     if prediction > 25000:
-        #         print "Error persists after a new training."
+
 
         y_predictions.append(prediction)
         y_target.append(X[(rowCount-1) % matrixLength][len(columns)-1])
@@ -248,11 +253,46 @@ while startTime < endTime:
         mu = mu; sigma = sigma
         Sn, Zn = severityMetric(error, mu, sigma, w, Sn_1)
         severityArray.append(Sn)
-        #Zscore_array[n] = Zn
+
+        # Robust EWMA - two-in-a-row rule applied (like 2 bit branch prediction)
+        if(row in event_dict):
+            ground_truth.append(1)
+        else:
+            ground_truth.append(0)
+
+        if np.abs(Sn) <= THRESHOLD:
+            anomaly_prediction.append(0)
+            alrt_counter = 0
+        elif np.abs(Sn) > THRESHOLD and alrt_counter == 0:
+            alrt_counter = 1
+            Sn = Sn_1
+            anomaly_prediction.append(0)
+        elif np.abs(Sn) > THRESHOLD and alrt_counter == 1:
+            anomaly_prediction.append(1)
+            Sn = 0
+            alrt_counter = 0
+        else:
+            anomaly_prediction.append(0)
+
+        # Checking if we correctly found the anomaly or not. If yes, is a True
+        # Positive (Tp). Otherwise, we count the False Positives (Fp) and False
+        # Negatives (Fn)
+        #print "gt: %d    ap: %d    rc: %d" % (len(ground_truth), len(anomaly_prediction), rowCount)
+        if ground_truth[rowCount-1] == 1 and anomaly_prediction[rowCount-1] == 1:
+            Tp += 1
+        elif ground_truth[rowCount-1] == 0 and anomaly_prediction[rowCount-1] == 1:
+            Fp += 1
+        elif ground_truth[rowCount-1] == 1 and anomaly_prediction[rowCount-1] == 0:
+            Fn += 1
+
+
+
         Sn_1 = Sn
         p = 1 - sp.stats.norm.cdf(error, mu, sigma)
         p_array.append(p)
-
+    else:
+        anomaly_prediction.append(0)
+        ground_truth.append(0)
 
     y_time.append(Xt[(rowCount-1) % matrixLength])
     #Increment and loop
@@ -307,6 +347,14 @@ print "-------------------------------------------------------------------------
 print "%20s |%20s |%25s |%20s" % ("RMSE-score (smoothed)", "RMSE-score (raw)", "Relative MSE", "SMSE")
 print "%20.2f  |%20.2f |%25.2f |%20.2f " % (np.mean(np.asarray(rmse_smoothed)), np.mean(np.asarray(rmse)), np.mean(np.asarray(Re_mse)), np.mean(np.asarray(smse)))
 print "-------------------------------------------------------------------------------------------------"
+
+if EVENT_NUMS != 0:
+    print "-------------------------------------------------------------------------------------------------"
+    print "Precision score: %.3f" % precision_score(ground_truth, anomaly_prediction)
+    print "Recall score: %.3f" % recall_score(ground_truth, anomaly_prediction)
+    print "F1 score: %.3f" % f1_score(ground_truth, anomaly_prediction)
+    print "Tp: %d Fp: %d Fn: %d" % (Tp, Fp, Fn)
+    print "-------------------------------------------------------------------------------------------------"
 
 OBSERVS_PER_HR = 60 / int(jsonDataFile["granularity"])
 axescolor  = '#f6f6f6'  # the axes background color
